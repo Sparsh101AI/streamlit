@@ -1,4 +1,3 @@
-
 import streamlit as st
 import cv2
 import numpy as np
@@ -38,6 +37,20 @@ with tabs[1]:
     show_black_overlay = st.checkbox("Show black spot overlay", value=True)
 with tabs[2]:
     show_inflamed_overlay = st.checkbox("Show inflamed overlay", value=True)
+
+
+# -----------------------------
+# Helpers for "good" messages
+# -----------------------------
+def has_any_pixels(mask: np.ndarray) -> bool:
+    return int(np.count_nonzero(mask)) > 0
+
+
+def has_large_component(mask: np.ndarray, min_area: int) -> bool:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False
+    return any(cv2.contourArea(c) >= min_area for c in contours)
 
 
 def fill_black_holes_inside_white(mask: np.ndarray) -> np.ndarray:
@@ -253,7 +266,9 @@ if uploaded is not None:
     rgb = np.array(img)
 
     gum_mask = detect_gums(rgb)
-    tooth_mask = cv2.bitwise_not(gum_mask)
+
+    gums_found = has_any_pixels(gum_mask)
+    tooth_mask = cv2.bitwise_not(gum_mask) if gums_found else np.ones((rgb.shape[0], rgb.shape[1]), dtype=np.uint8) * 255
 
     plaque_mask = detect_plaque(
         rgb, tooth_mask,
@@ -267,42 +282,74 @@ if uploaded is not None:
     )
 
     inflamed_mask = detect_inflamed_gums(
-        rgb, gum_mask,
+        rgb, gum_mask if gums_found else np.zeros_like(tooth_mask),
         INFLAMED_A_MIN, INFLAMED_S_MIN, MIN_INFLAMED_AREA
     )
 
     st.subheader("Original")
     st.image(rgb, width="stretch")
 
+    # -----------------------------
+    # Plaque tab
+    # -----------------------------
     with tabs[0]:
+        plaque_ok = not has_large_component(plaque_mask, MIN_BLACK_AREA)  # reuse area threshold-ish
+        if plaque_ok:
+            st.success("✅ No plaque detected. Looks good!")
+        else:
+            st.warning("⚠️ Plaque-like regions detected.")
+
         plaque_mask_gray = np.where(plaque_mask > 0, 170, 0).astype(np.uint8)
         st.subheader("Plaque mask (gray)")
         st.image(plaque_mask_gray, width="stretch")
 
-        if show_plaque_overlay:
+        if show_plaque_overlay and not plaque_ok:
             overlay = draw_boundaries_and_label(rgb, plaque_mask, "Plaque", color_bgr=(0, 120, 255))
             st.subheader("Overlay (plaque boundary highlighted)")
             st.image(overlay, width="stretch")
 
+    # -----------------------------
+    # Cavity tab
+    # -----------------------------
     with tabs[1]:
+        cavity_ok = not has_large_component(black_spot_mask, MIN_BLACK_AREA)
+        if cavity_ok:
+            st.success("✅ No cavities or dark spots detected. Looks good!")
+        else:
+            st.warning("⚠️ Dark spot regions detected (possible cavities).")
+
         black_mask_gray = np.where(black_spot_mask > 0, 170, 0).astype(np.uint8)
         st.subheader("Cavity Mask")
         st.image(black_mask_gray, width="stretch")
 
-        if show_black_overlay:
+        if show_black_overlay and not cavity_ok:
             overlay = draw_boundaries_and_label(rgb, black_spot_mask, "Black spots", color_bgr=(255, 0, 0))
             st.subheader("Cavity Highlight")
             st.image(overlay, width="stretch")
 
+    # -----------------------------
+    # Gums tab
+    # -----------------------------
     with tabs[2]:
-        st.subheader("Inflamed gums detection (inside gum mask)")
+        if not gums_found:
+            st.success("✅ Gums not detected in this image (may be a tooth-only photo).")
+        else:
+            inflamed_ok = not has_large_component(inflamed_mask, MIN_INFLAMED_AREA)
+            if inflamed_ok:
+                st.success("✅ No inflamed gums detected. Looks good!")
+            else:
+                st.warning("⚠️ Inflamed gum-like regions detected.")
+
         inflamed_gray = np.where(inflamed_mask > 0, 170, 0).astype(np.uint8)
         st.subheader("Inflamed mask (gray)")
         st.image(inflamed_gray, width="stretch")
 
-        if show_inflamed_overlay:
-            overlay = draw_boundaries_and_label(rgb, inflamed_mask, "Inflamed", color_bgr=(0, 0, 255))
-            st.subheader("Overlay (inflamed boundary highlighted)")
-            st.image(overlay, width="stretch")
+        if show_inflamed_overlay and gums_found:
+            # only show overlay when there's actually something to show
+            if has_large_component(inflamed_mask, MIN_INFLAMED_AREA):
+                overlay = draw_boundaries_and_label(rgb, inflamed_mask, "Inflamed", color_bgr=(0, 0, 255))
+                st.subheader("Overlay (inflamed boundary highlighted)")
+                st.image(overlay, width="stretch")
+
 else:
     st.info("Upload a tooth image to see results.")
