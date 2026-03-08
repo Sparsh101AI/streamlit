@@ -11,33 +11,34 @@ uploaded = st.file_uploader("Upload a tooth image", type=["jpg", "jpeg", "png"])
 tabs = st.tabs(["Plaque", "Cavity", "Gums"])
 
 # -----------------------------
-# HARD-CODED thresholds (no sliders)
+# Sliders inside each tab
 # -----------------------------
-# Plaque
-PLAQUE_S_MIN = 60
-PLAQUE_B_MIN = 140
-PLAQUE_H_LOW = 10
-PLAQUE_H_HIGH = 40
-PLAQUE_L_MAX = 220
-
-# Black spots / cavities
-# Black spots / cavities
-BLACK_V_MAX = 100
-BLACK_S_MAX = 255
-MIN_BLACK_AREA = 50
-
-# Inflamed gums
-INFLAMED_A_MIN = 176
-INFLAMED_S_MIN = 70
-MIN_INFLAMED_AREA = 150
-
-# Optional toggles (not sliders)
 with tabs[0]:
     show_plaque_overlay = st.checkbox("Show plaque overlay", value=True)
+    with st.expander("🔧 Plaque Thresholds", expanded=False):
+        PLAQUE_H_LOW   = st.slider("Hue Low",        0, 179,  10, help="Lower bound of yellow hue range")
+        PLAQUE_H_HIGH  = st.slider("Hue High",       0, 179,  40, help="Upper bound of yellow hue range")
+        PLAQUE_S_MIN   = st.slider("Saturation Min", 0, 255,  60, help="Min saturation to count as plaque")
+        PLAQUE_B_MIN   = st.slider("LAB-B Min",      0, 255, 140, help="Min LAB B channel (yellowness)")
+        PLAQUE_L_MAX   = st.slider("LAB-L Max",      0, 255, 220, help="Max lightness (exclude very bright whites)")
+
 with tabs[1]:
     show_black_overlay = st.checkbox("Show black spot overlay", value=True)
+    with st.expander("🔧 Cavity Thresholds", expanded=False):
+        BLACK_V_MAX    = st.slider("Value Max (absolute darkness)", 0, 255, 100,  help="Max HSV V — lower = only very dark spots")
+        BLACK_S_MAX    = st.slider("Saturation Max",                0, 255, 180,  help="Max HSV S for dark spots")
+        CONTRAST_THRESH = st.slider("Local Contrast Threshold",     5,  80,  25,  help="How much darker than surroundings a cavity must be (LAB-L units)")
+        MIN_BLACK_AREA = st.slider("Min Area (px²)",                1, 500,  50,  help="Ignore blobs smaller than this")
+        OVERLAP_RATIO  = st.slider("Min Tooth Overlap",           0.0, 1.0, 0.80, step=0.05, help="Fraction of spot inside tooth")
+        RING_RATIO     = st.slider("Min Ring Tooth Ratio",        0.0, 1.0, 0.65, step=0.05, help="Fraction of surrounding ring that must be tooth")
+        MIN_DIST       = st.slider("Min Edge Distance (px)",        1,  20,   3,  help="Spot must be this many px inside tooth")
+
 with tabs[2]:
     show_inflamed_overlay = st.checkbox("Show inflamed overlay", value=True)
+    with st.expander("🔧 Gum Thresholds", expanded=False):
+        INFLAMED_A_MIN    = st.slider("LAB-A Min (redness)",  128, 255, 176, help="Min LAB A channel — higher = more red")
+        INFLAMED_S_MIN    = st.slider("Saturation Min",         0, 255,  70, help="Min HSV saturation for inflamed region")
+        MIN_INFLAMED_AREA = st.slider("Min Area (px²)",         1, 500, 150, help="Ignore inflamed blobs smaller than this")
 
 
 # -----------------------------
@@ -172,30 +173,81 @@ def detect_plaque(
     return plaque
 
 
-def detect_black_spots(rgb, tooth_mask, V_max, S_max, min_area):
+def detect_black_spots(rgb, tooth_mask, V_max, S_max, min_area,
+                       overlap_ratio=0.80, ring_ratio=0.65, min_dist=3,
+                       contrast_thresh=25.0):
+    """
+    Cavity detection strategy:
+    
+    1. GLOBAL DARK FILTER — catch pixels that are absolutely dark (V < V_max).
+       Cavities are genuinely darker than surrounding enamel.
+
+    2. LOCAL CONTRAST FILTER — catch pixels that are dark *relative to their
+       neighbourhood* on the same tooth. This handles yellowed/stained teeth
+       where absolute brightness is low everywhere: a cavity still creates a
+       locally darker patch. We use an adaptive threshold on the LAB-L channel.
+
+    3. BROWN/DARK-BROWN colour cue — early cavities are often brown, not black.
+       We add a hue range for dark-brown tones (H 5-25, moderate S, low-mid V).
+
+    4. All candidates are combined, masked to the tooth, then filtered by:
+       - minimum contour area
+       - not a gap/shadow shape (aspect ratio)
+       - distance transform: must sit inside the tooth, not on an edge
+       - solidity: cavities tend to be compact blobs, not spidery noise
+    """
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     blur = cv2.GaussianBlur(bgr, (5, 5), 0)
 
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     H, S, V = cv2.split(hsv)
 
-    # Dark candidate pixels
-    black = ((V <= V_max) & (S <= S_max)).astype(np.uint8) * 255
+    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
+    L_lab, A_lab, B_lab = cv2.split(lab)
 
-    # Only allow dark pixels inside teeth
-    black = cv2.bitwise_and(black, tooth_mask)
+    # ── 1. Global absolute darkness ──────────────────────────────────────────
+    global_dark = (V.astype(np.int32) <= V_max).astype(np.uint8) * 255
 
-    # Shrink tooth region so edges / mouth gaps are less likely
-    inner_tooth = cv2.erode(tooth_mask, np.ones((9, 9), np.uint8), iterations=1)
-    black = cv2.bitwise_and(black, inner_tooth)
-    dist_map = cv2.distanceTransform((inner_tooth > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    # ── 2. Local contrast: pixels significantly darker than local neighbourhood
+    #    Use a large Gaussian as the "local average", then find pixels that are
+    #    much darker than their surroundings (strong negative deviation).
+    L_float = L_lab.astype(np.float32)
+    local_mean = cv2.GaussianBlur(L_float, (51, 51), 0)
+    # Pixel is a cavity candidate if it is at least `contrast_thresh` darker
+    # than the local average brightness on the same tooth area
+    contrast_thresh = float(contrast_thresh)
+    local_dark = ((local_mean - L_float) > contrast_thresh).astype(np.uint8) * 255
 
-    # Clean noise
-    black = cv2.morphologyEx(black, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    black = cv2.morphologyEx(black, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    # ── 3. Brown / dark-brown colour cue (early-stage cavities) ──────────────
+    brown_hue = ((H >= 5) & (H <= 25))
+    brown = (
+        brown_hue &
+        (S >= 40) & (S <= S_max) &
+        (V >= 30) & (V <= int(V_max * 1.4))   # slightly brighter than black
+    ).astype(np.uint8) * 255
 
-    contours, _ = cv2.findContours(black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    keep = np.zeros_like(black)
+    # ── Combine all three signals ─────────────────────────────────────────────
+    candidates = cv2.bitwise_or(global_dark, local_dark)
+    candidates = cv2.bitwise_or(candidates, brown)
+
+    # ── Restrict to tooth interior ────────────────────────────────────────────
+    candidates = cv2.bitwise_and(candidates, tooth_mask)
+
+    # Erode tooth boundary to avoid inter-tooth gaps and lip shadows
+    inner_tooth = cv2.erode(tooth_mask, np.ones((7, 7), np.uint8), iterations=1)
+    candidates = cv2.bitwise_and(candidates, inner_tooth)
+
+    dist_map = cv2.distanceTransform(
+        (inner_tooth > 0).astype(np.uint8), cv2.DIST_L2, 5
+    )
+
+    # ── Morphological cleanup ─────────────────────────────────────────────────
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8), iterations=1)
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
+
+    # ── Per-contour filtering ─────────────────────────────────────────────────
+    contours, _ = cv2.findContours(candidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    keep = np.zeros_like(candidates)
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -204,50 +256,46 @@ def detect_black_spots(rgb, tooth_mask, V_max, S_max, min_area):
 
         x, y, w, h = cv2.boundingRect(cnt)
 
-        # Reject vertical gaps
-        if h > 2.2 * max(w, 1):
+        # Shape: reject inter-tooth vertical gaps and horizontal lip bands
+        aspect = w / max(h, 1)
+        if h > 3.5 * max(w, 1):   # very tall thin sliver → inter-tooth gap
+            continue
+        if aspect > 5.0:           # very wide flat band → shadow / lip line
             continue
 
-        # Reject horizontal gaps between upper/lower teeth
-        if w > 2.5 * max(h, 1):
+        # Solidity: cavities are compact blobs; gaps/shadows are irregular
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1e-5)
+        if solidity < 0.35:        # too irregular → likely noise/shadow
             continue
 
-        mask_cnt = np.zeros_like(black)
+        mask_cnt = np.zeros_like(candidates)
         cv2.drawContours(mask_cnt, [cnt], -1, 255, -1)
 
-        # Must be deeper inside tooth (not edge gap)
-        candidate_distances = dist_map[mask_cnt > 0]
-        if len(candidate_distances) == 0:
+        # Distance from tooth edge: must be genuinely inside the tooth
+        pixel_dists = dist_map[mask_cnt > 0]
+        if len(pixel_dists) == 0 or np.max(pixel_dists) < min_dist:
             continue
 
-        if np.max(candidate_distances) < 6:
+        # Overlap with inner tooth region
+        overlap_px = np.count_nonzero(cv2.bitwise_and(mask_cnt, inner_tooth))
+        if overlap_px / (np.count_nonzero(mask_cnt) + 1e-5) < overlap_ratio:
             continue
 
-
-        # Must be almost fully inside tooth
-        overlap = cv2.bitwise_and(mask_cnt, inner_tooth)
-        overlap_ratio = np.count_nonzero(overlap) / (np.count_nonzero(mask_cnt) + 1e-5)
-        if overlap_ratio < 0.97:
-            continue
-
-        # The area around the dark spot should also mostly be tooth
-        dilated = cv2.dilate(mask_cnt, np.ones((11, 11), np.uint8), iterations=1)
-        ring = cv2.subtract(dilated, mask_cnt)
-
-        ring_pixels = np.count_nonzero(ring)
-        if ring_pixels == 0:
-            continue
-
-        ring_on_tooth = cv2.bitwise_and(ring, inner_tooth)
-        ring_tooth_ratio = np.count_nonzero(ring_on_tooth) / (ring_pixels + 1e-5)
-
-        # If surroundings are not mostly tooth, it is probably a gap/open mouth shadow
-        if ring_tooth_ratio < 0.85:
-            continue
+        # Ring check: surroundings must be mostly tooth (not open mouth / bg)
+        ring_dilated = cv2.dilate(mask_cnt, np.ones((11, 11), np.uint8), iterations=1)
+        ring = cv2.subtract(ring_dilated, mask_cnt)
+        ring_px = np.count_nonzero(ring)
+        if ring_px > 0:
+            ring_tooth = np.count_nonzero(cv2.bitwise_and(ring, inner_tooth))
+            if ring_tooth / (ring_px + 1e-5) < ring_ratio:
+                continue
 
         cv2.drawContours(keep, [cnt], -1, 255, -1)
 
     return keep
+
 
 def detect_inflamed_gums(
     rgb: np.ndarray,
@@ -365,7 +413,9 @@ if uploaded is not None:
 
     black_spot_mask = detect_black_spots(
         rgb, tooth_mask,
-        BLACK_V_MAX, BLACK_S_MAX, MIN_BLACK_AREA
+        BLACK_V_MAX, BLACK_S_MAX, MIN_BLACK_AREA,
+        overlap_ratio=OVERLAP_RATIO, ring_ratio=RING_RATIO, min_dist=MIN_DIST,
+        contrast_thresh=CONTRAST_THRESH
     )
 
     inflamed_mask = detect_inflamed_gums(
@@ -380,7 +430,7 @@ if uploaded is not None:
     # Plaque tab
     # -----------------------------
     with tabs[0]:
-        plaque_ok = not has_large_component(plaque_mask, MIN_BLACK_AREA)  # reuse area threshold-ish
+        plaque_ok = not has_large_component(plaque_mask, MIN_BLACK_AREA)
         if plaque_ok:
             st.success("✅ No plaque detected. Looks good!")
         else:
@@ -399,20 +449,6 @@ if uploaded is not None:
     # Cavity tab
     # -----------------------------
     with tabs[1]:
-
-
-        # Black spots / cavities
-        BLACK_V_MAX = 100
-        BLACK_S_MAX = 255
-        MIN_BLACK_AREA = 50
-
-        # Detect cavities (black spots) only inside the tooth
-        black_spot_mask = detect_black_spots(
-            rgb, tooth_mask,
-            BLACK_V_MAX, BLACK_S_MAX, MIN_BLACK_AREA
-        )
-
-        # Check if cavities exist
         cavity_ok = not has_large_component(black_spot_mask, MIN_BLACK_AREA)
 
         if cavity_ok:
@@ -420,50 +456,28 @@ if uploaded is not None:
         else:
             st.warning("⚠️ Dark spot regions detected (possible cavities).")
 
-        # Show cavity mask in grayscale
         black_mask_gray = np.where(black_spot_mask > 0, 170, 0).astype(np.uint8)
-
         st.subheader("Cavity Mask (gray)")
         st.image(black_mask_gray, width="stretch")
 
-        # Show overlay highlighting only black spots inside teeth
         if show_black_overlay and not cavity_ok:
-
             overlay = rgb.copy()
-
             contours, _ = cv2.findContours(
-                black_spot_mask,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE
+                black_spot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-
             for cnt in contours:
-
                 if cv2.contourArea(cnt) >= MIN_BLACK_AREA:
-
-                    cv2.drawContours(
-                        overlay,
-                        [cnt],
-                        -1,
-                        (255, 0, 0),
-                        thickness=3
-                    )
-
+                    cv2.drawContours(overlay, [cnt], -1, (255, 0, 0), thickness=3)
                     x, y, w, h = cv2.boundingRect(cnt)
-
                     cv2.putText(
-                        overlay,
-                        "Cavity",
+                        overlay, "Cavity",
                         (x, max(0, y - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 0, 0),
-                        2,
-                        cv2.LINE_AA
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 0, 0), 2, cv2.LINE_AA
                     )
-
             st.subheader("Cavity Highlight")
             st.image(overlay, width="stretch")
+
     # -----------------------------
     # Gums tab
     # -----------------------------
@@ -482,7 +496,6 @@ if uploaded is not None:
         st.image(inflamed_gray, width="stretch")
 
         if show_inflamed_overlay and gums_found:
-            # only show overlay when there's actually something to show
             if has_large_component(inflamed_mask, MIN_INFLAMED_AREA):
                 overlay = draw_boundaries_and_label(rgb, inflamed_mask, "Inflamed", color_bgr=(0, 0, 255))
                 st.subheader("Overlay (inflamed boundary highlighted)")
